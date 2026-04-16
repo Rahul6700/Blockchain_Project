@@ -1,0 +1,21 @@
+{
+  "name": "lost-found-blockchain",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "node:start": "hardhat node",
+    "deploy": "hardhat run scripts/deploy.js --network localhost",
+    "dev": "bash scripts/start-dev.sh"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^6.1.2",
+    "concurrently": "^9.2.1",
+    "hardhat": "^2.22.0",
+    "wait-on": "^9.0.5"
+  }
+}
