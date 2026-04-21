@@ -524,7 +524,161 @@ button {
 /* 3-state badges: Reported, Claimed, Returned */
 .status-0 { background: rgba(59, 130, 246, 0.15);  color: #60a5fa; }  /* Reported */
 .status-1 { background: rgba(139, 92, 246, 0.15);  color: #c084fc; }  /* Claimed  */
-.status-2 { background: rgba(16, 185, 129, 0.15);  color: #34d399; }  /* Returned */
+.status-2 { background: rgba(245, 158, 11, 0.15);  color: #fbbf24; }  /* Handoff Pending */
+.status-3 { background: rgba(16, 185, 129, 0.15);  color: #34d399; }  /* Returned */
+
+/* ==============================
+   Claimant List (Reporter View)
+   ============================== */
+
+.claimant-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-top: 0.25rem;
+}
+
+.claimant-list-header {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding-bottom: 0.3rem;
+  border-bottom: 1px solid var(--border-glass);
+}
+
+.claimant-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.5rem;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.2);
+  flex-wrap: wrap;
+}
+
+.claimant-addr {
+  font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+  font-size: 0.78rem;
+  color: var(--text-main);
+  flex: 1;
+  min-width: 90px;
+}
+
+.claimant-stats {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+
+.claimant-fails {
+  font-size: 0.72rem;
+  color: var(--danger);
+  font-weight: 500;
+}
+
+.claimant-status {
+  font-size: 0.68rem;
+  font-weight: 700;
+  padding: 0.1rem 0.4rem;
+  border-radius: 20px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.status-blocked {
+  background: rgba(239, 68, 68, 0.15);
+  color: #fca5a5;
+}
+
+.status-open {
+  background: rgba(16, 185, 129, 0.15);
+  color: #34d399;
+}
+
+.claimant-reopens {
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.btn-reopen {
+  background: rgba(59, 130, 246, 0.15);
+  color: #60a5fa;
+  border: 1px solid rgba(59, 130, 246, 0.3);
+  padding: 0.2rem 0.55rem;
+  border-radius: 6px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn-reopen:hover {
+  background: rgba(59, 130, 246, 0.25);
+}
+
+.claimant-maxed {
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* ==============================
+   Cancel Audit Trail
+   ============================== */
+
+.cancel-audit {
+  margin-top: 0.5rem;
+  border-top: 1px solid var(--border-glass);
+  padding-top: 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.cancel-audit-header {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.cancel-record {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.75rem;
+  padding: 0.35rem 0.5rem;
+  background: rgba(239, 68, 68, 0.06);
+  border: 1px solid rgba(239, 68, 68, 0.12);
+  border-radius: 6px;
+}
+
+.cancel-label {
+  color: var(--text-muted);
+}
+
+.cancel-addr {
+  font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+  color: var(--text-main);
+  font-size: 0.72rem;
+}
+
+.cancel-time {
+  color: var(--text-muted);
+  font-size: 0.68rem;
+}
+
+.cancel-open {
+  color: var(--warning);
+  font-style: italic;
+  font-size: 0.72rem;
+}
 
 .item-details {
   display: flex;

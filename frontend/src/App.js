@@ -8,8 +8,8 @@ import {
 } from "./utils/contract";
 import { ethers } from "ethers";
 
-// Trustless 3-state machine
-const STATUS_LABELS = ["Reported", "Claimed", "Returned"];
+// 4-state machine: Reported → Claimed → HandoffPending → Returned
+const STATUS_LABELS = ["Reported", "Claimed", "Handoff Pending", "Returned"];
 const HARDHAT_CHAIN_ID = "0x7a69"; // 31337
 
 function truncateAddress(addr) {
@@ -46,9 +46,10 @@ function itemStatus(item) {
 function StatusTimeline({ item }) {
   const st = itemStatus(item);
   const steps = [
-    { label: "Reported", time: item.reportedAt },
-    { label: "Claimed",  time: item.claimedAt  },
-    { label: "Returned", time: item.returnedAt  },
+    { label: "Reported",   time: item.reportedAt },
+    { label: "Claimed",    time: item.claimedAt  },
+    { label: "Handoff",    time: item.handoffAt  },
+    { label: "Returned",   time: item.returnedAt  },
   ];
 
   return (
@@ -190,28 +191,85 @@ function App() {
         const rawId = await contract.getItemIdAtIndex(i);
         const idNorm = normalizeItemId(rawId);
         const data = await contract.getItem(idNorm);
+        const st = Number(data.status);
+        const reporterAddr = data.reporter.toLowerCase();
+        const isCurrentReporter = account && reporterAddr === account.toLowerCase();
 
-        // Rule 2: check if current wallet already used their attempt this round
-        let alreadyAttempted = false;
-        if (account) {
+        // Check if current user is blocked from claiming (only relevant in Reported state)
+        let blocked = false;
+        if (account && st === 0 && !isCurrentReporter) {
           try {
-            alreadyAttempted = await contract.hasAttemptedClaim(idNorm, account);
-          } catch { /* safe to ignore on first load */ }
+            const ci = await contract.getClaimantInfo(idNorm, account);
+            blocked = ci.blocked;
+          } catch { /* ignore */ }
+        }
+
+        // Load full claimant list for the reporter's view (only in Reported state)
+        let claimants = [];
+        if (isCurrentReporter && st === 0) {
+          try {
+            const addrs = await contract.getItemClaimants(idNorm);
+            for (const addr of addrs) {
+              const ci = await contract.getClaimantInfo(idNorm, addr);
+              claimants.push({
+                address:          addr,
+                failedAttempts:   Number(ci.failedAttempts),
+                blocked:          ci.blocked,
+                reopensUsed:      Number(ci.reopensUsed),
+                reopensRemaining: Number(ci.reopensRemaining),
+              });
+            }
+          } catch { /* ignore */ }
+        }
+
+        // Load handoff / cancel info for HandoffPending or Returned states
+        let handoffInfo = {
+          hasPendingCancel:  false,
+          cancelRequester:   "",
+          cancelRequestedAt: 0,
+          totalCancels:      0,
+          cancelRecords:     [],
+        };
+        if (st === 2 || st === 3) {
+          try {
+            const hi = await contract.getHandoffInfo(idNorm);
+            const totalCancels = Number(hi.totalCancels);
+            const cancelRecords = [];
+            for (let c = 0; c < totalCancels; c++) {
+              const rec = await contract.getCancelRecord(idNorm, c);
+              cancelRecords.push({
+                requester:   rec.requester,
+                requestedAt: Number(rec.requestedAt),
+                approved:    rec.approved,
+                approver:    rec.approver,
+                approvedAt:  Number(rec.approvedAt),
+              });
+            }
+            handoffInfo = {
+              hasPendingCancel:  hi.hasPendingCancel,
+              cancelRequester:   hi.cancelRequester,
+              cancelRequestedAt: Number(hi.cancelRequestedAt),
+              totalCancels,
+              cancelRecords,
+            };
+          } catch { /* ignore */ }
         }
 
         allItems.push({
-          itemId:          idNorm,
-          reporter:        data.reporter,
-          claimant:        data.claimant,
-          description:     data.description,
-          threshold:       Number(data.threshold),
-          featureCount:    Number(data.featureCount),
-          status:          Number(data.status),
-          reportedAt:      Number(data.reportedAt),
-          claimedAt:       Number(data.claimedAt),
-          returnedAt:      Number(data.returnedAt),
-          claimRound:      Number(data.claimRound),
-          alreadyAttempted,
+          itemId:       idNorm,
+          reporter:     data.reporter,
+          claimant:     data.claimant,
+          description:  data.description,
+          threshold:    Number(data.threshold),
+          featureCount: Number(data.featureCount),
+          status:       st,
+          reportedAt:   Number(data.reportedAt),
+          claimedAt:    Number(data.claimedAt),
+          handoffAt:    Number(data.handoffAt),
+          returnedAt:   Number(data.returnedAt),
+          blocked,
+          claimants,
+          handoffInfo,
         });
       }
       setItems(allItems);
@@ -226,7 +284,7 @@ function App() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [account]);
 
   // -------------------- Effects --------------------
 
@@ -277,10 +335,14 @@ function App() {
       return;
     }
     const reload = () => loadItems();
-    contract.on("ItemReported", reload);
-    contract.on("ItemClaimed", reload);
-    contract.on("ItemReturned", reload);
-    contract.on("ClaimSubmitted", reload);
+    contract.on("ItemReported",          reload);
+    contract.on("ItemClaimed",           reload);
+    contract.on("HandoffConfirmed",      reload);
+    contract.on("ReceiptConfirmed",      reload);
+    contract.on("ClaimSubmitted",        reload);
+    contract.on("ClaimantReopened",      reload);
+    contract.on("CancelHandoffRequested",reload);
+    contract.on("CancelHandoffApproved", reload);
     return () => {
       if (eventContractRef.current) {
         eventContractRef.current.removeAllListeners();
@@ -301,13 +363,29 @@ function App() {
     if (lower.includes("cannot claim it yourself"))
       return "You reported this item — you cannot claim your own report.";
     if (lower.includes("already attempted to claim"))
-      return "You have already submitted a claim for this item this round. Wait for the reporter to reopen claiming.";
-    if (lower.includes("only the finder") || lower.includes("original reporter"))
+      return "You have already submitted a claim. Wait for the reporter to reopen your attempt.";
+    if (lower.includes("only the reporter can confirm handoff"))
       return "Only the wallet that reported this item can confirm the physical handoff.";
+    if (lower.includes("only the verified owner can confirm receipt"))
+      return "Only the verified owner (claimant) can confirm receipt.";
+    if (lower.includes("only the reporter can reopen"))
+      return "Only the reporter can selectively reopen claiming for a claimant.";
+    if (lower.includes("maximum reopens already granted"))
+      return `This claimant has reached the maximum number of reopens allowed.`;
+    if (lower.includes("this address has not attempted"))
+      return "This address hasn't attempted to claim this item yet.";
+    if (lower.includes("cancel request is already open"))
+      return "A cancel request is already open. The other party must respond to it first.";
+    if (lower.includes("no pending cancel request"))
+      return "There is no open cancel request to approve.";
+    if (lower.includes("cannot approve your own cancel"))
+      return "You cannot approve your own cancel request — the other party must approve.";
     if (lower.includes("reported state to claim"))
       return "This item is not open for claims anymore (already claimed or returned). Click Refresh.";
-    if (lower.includes("claimed state to confirm"))
-      return "This item is not waiting for a handoff confirmation yet. Click Refresh.";
+    if (lower.includes("must be in claimed state"))
+      return "Handoff can only be confirmed while the item is in Claimed state. Click Refresh.";
+    if (lower.includes("must be in handoffpending state"))
+      return "This action requires the item to be in Handoff Pending state. Click Refresh.";
     if (lower.includes("item does not exist"))
       return "This item ID was not found on the chain. Redeploy the contract or refresh.";
     if (lower.includes("user rejected") || lower.includes("user denied"))
@@ -405,58 +483,94 @@ function App() {
     }
   };
 
-  const confirmReturn = async (rawItemId) => {
+  // Two-step handoff: Step 1 — reporter confirms physical handoff
+  const confirmHandoff = async (rawItemId) => {
     const itemId = normalizeItemId(rawItemId);
     if (pendingIds.has(itemId)) return;
-
     try {
-      const contract = await getContract();
-      const onChain = await contract.getItem(itemId);
-      const st = Number(onChain.status);
-      if (st !== 1) {
-        await loadItems();
-        alert(
-          "Handoff can only be confirmed while the item is Claimed. Click Refresh and try again."
-        );
-        return;
-      }
-
       setPendingIds((prev) => new Set(prev).add(itemId));
-      const tx = await contract.confirmReturn(itemId);
+      const contract = await getContract();
+      const tx = await contract.confirmHandoff(itemId);
       await tx.wait();
       await loadItems();
     } catch (err) {
       console.error(err);
-      await loadItems();
-      alert("Confirm return failed: " + friendlyError(err));
+      alert("Confirm handoff failed: " + friendlyError(err));
     } finally {
-      setPendingIds((prev) => {
-        const next = new Set(prev);
-        next.delete(itemId);
-        return next;
-      });
+      setPendingIds((prev) => { const n = new Set(prev); n.delete(itemId); return n; });
     }
   };
 
-  // Rule 3: reporter reopens claiming for a new round after failed attempts
-  const reopenClaiming = async (rawItemId) => {
+  // Two-step handoff: Step 2 — claimant confirms they received the item
+  const confirmReceipt = async (rawItemId) => {
     const itemId = normalizeItemId(rawItemId);
     if (pendingIds.has(itemId)) return;
     try {
       setPendingIds((prev) => new Set(prev).add(itemId));
       const contract = await getContract();
-      const tx = await contract.reopenClaiming(itemId);
+      const tx = await contract.confirmReceipt(itemId);
       await tx.wait();
       await loadItems();
     } catch (err) {
       console.error(err);
-      alert("Failed to reopen claiming: " + friendlyError(err));
+      alert("Confirm receipt failed: " + friendlyError(err));
     } finally {
-      setPendingIds((prev) => {
-        const next = new Set(prev);
-        next.delete(itemId);
-        return next;
-      });
+      setPendingIds((prev) => { const n = new Set(prev); n.delete(itemId); return n; });
+    }
+  };
+
+  // Selective reopen: reporter unblocks one specific failed claimant
+  const reopenForClaimant = async (rawItemId, claimantAddr) => {
+    const itemId = normalizeItemId(rawItemId);
+    const key = `${itemId}-${claimantAddr}`;
+    if (pendingIds.has(key)) return;
+    try {
+      setPendingIds((prev) => new Set(prev).add(key));
+      const contract = await getContract();
+      const tx = await contract.reopenForClaimant(itemId, claimantAddr);
+      await tx.wait();
+      await loadItems();
+    } catch (err) {
+      console.error(err);
+      alert("Reopen failed: " + friendlyError(err));
+    } finally {
+      setPendingIds((prev) => { const n = new Set(prev); n.delete(key); return n; });
+    }
+  };
+
+  // Mutual cancel: request cancellation of a pending handoff
+  const requestCancelHandoff = async (rawItemId) => {
+    const itemId = normalizeItemId(rawItemId);
+    if (pendingIds.has(itemId)) return;
+    try {
+      setPendingIds((prev) => new Set(prev).add(itemId));
+      const contract = await getContract();
+      const tx = await contract.requestCancelHandoff(itemId);
+      await tx.wait();
+      await loadItems();
+    } catch (err) {
+      console.error(err);
+      alert("Cancel request failed: " + friendlyError(err));
+    } finally {
+      setPendingIds((prev) => { const n = new Set(prev); n.delete(itemId); return n; });
+    }
+  };
+
+  // Mutual cancel: approve the other party's cancel request
+  const approveCancelHandoff = async (rawItemId) => {
+    const itemId = normalizeItemId(rawItemId);
+    if (pendingIds.has(itemId)) return;
+    try {
+      setPendingIds((prev) => new Set(prev).add(itemId));
+      const contract = await getContract();
+      const tx = await contract.approveCancelHandoff(itemId);
+      await tx.wait();
+      await loadItems();
+    } catch (err) {
+      console.error(err);
+      alert("Approve cancel failed: " + friendlyError(err));
+    } finally {
+      setPendingIds((prev) => { const n = new Set(prev); n.delete(itemId); return n; });
     }
   };
 
@@ -731,43 +845,85 @@ function App() {
                         <StatusTimeline item={item} />
 
                         <div className="item-actions">
-                          {/* Reported → branching by who is viewing */}
+
+                          {/* ── State 0: Reported ── */}
                           {st === 0 && (() => {
-                            // Rule 1: reporter sees lock + reopen button instead of claim form
                             if (isReporter) {
+                              // Reporter sees: lock notice + full claimant list with per-person reopen
                               return (
                                 <div className="action-group">
                                   <div className="action-info">
                                     You reported this item — you cannot claim it yourself.
                                   </div>
-                                  {/* Rule 3: start a new round so others can retry */}
-                                  <button
-                                    className="btn-action btn-secondary"
-                                    onClick={() => reopenClaiming(idKey)}
-                                    disabled={busy}
-                                    title="Resets everyone's attempt so they can try again"
-                                  >
-                                    {busy ? "Processing..." : `Reopen Claiming (Round ${item.claimRound + 1})`}
-                                  </button>
+                                  {item.claimants.length === 0 ? (
+                                    <div className="action-info" style={{fontSize:"0.78rem"}}>
+                                      No one has attempted to claim this item yet.
+                                    </div>
+                                  ) : (
+                                    <div className="claimant-list">
+                                      <div className="claimant-list-header">
+                                        Claim Attempts ({item.claimants.length})
+                                      </div>
+                                      {item.claimants.map((c) => {
+                                        const rowKey = `${idKey}-${c.address}`;
+                                        const rowBusy = pendingIds.has(rowKey);
+                                        const canReopen = c.blocked && c.reopensRemaining > 0;
+                                        return (
+                                          <div key={c.address} className="claimant-row">
+                                            <div className="claimant-addr" title={c.address}>
+                                              {truncateAddress(c.address)}
+                                            </div>
+                                            <div className="claimant-stats">
+                                              <span className="claimant-fails">
+                                                {c.failedAttempts} false {c.failedAttempts === 1 ? "attempt" : "attempts"}
+                                              </span>
+                                              <span className={`claimant-status ${c.blocked ? "status-blocked" : "status-open"}`}>
+                                                {c.blocked ? "blocked" : "open"}
+                                              </span>
+                                              {c.reopensUsed > 0 && (
+                                                <span className="claimant-reopens">
+                                                  {c.reopensUsed} reopen{c.reopensUsed > 1 ? "s" : ""} used
+                                                </span>
+                                              )}
+                                            </div>
+                                            {canReopen ? (
+                                              <button
+                                                className="btn-reopen"
+                                                onClick={() => reopenForClaimant(idKey, c.address)}
+                                                disabled={rowBusy}
+                                                title={`${c.reopensRemaining} reopen${c.reopensRemaining === 1 ? "" : "s"} remaining`}
+                                              >
+                                                {rowBusy ? "..." : `Reopen (${c.reopensRemaining} left)`}
+                                              </button>
+                                            ) : c.blocked && c.reopensRemaining === 0 ? (
+                                              <span className="claimant-maxed">Max reopens reached</span>
+                                            ) : null}
+                                          </div>
+                                        );
+                                      })}
+                                    </div>
+                                  )}
                                 </div>
                               );
                             }
-                            // Rule 2: claimant already used their attempt this round
-                            if (item.alreadyAttempted) {
+
+                            if (item.blocked) {
+                              // Claimant already used their attempt
                               return (
                                 <div className="action-info">
-                                  You already submitted a claim this round. Wait for the
-                                  reporter to reopen claiming if you believe you are the owner.
+                                  You already submitted a claim. Wait for the reporter
+                                  to reopen your attempt if you believe you are the owner.
                                 </div>
                               );
                             }
+
                             // Normal claim form
                             return (
                               <div className="action-group">
                                 <input
                                   type="text"
                                   className="input-field-small"
-                                  placeholder="Exact features you used when reporting (comma-separated)"
+                                  placeholder="Exact features you know (comma-separated)"
                                   value={claimFeatures[idKey] || ""}
                                   onChange={(e) =>
                                     setClaimFeatures((prev) => ({
@@ -788,27 +944,150 @@ function App() {
                             );
                           })()}
 
-                          {/* Claimed → Only original reporter confirms return */}
+                          {/* ── State 1: Claimed — reporter initiates handoff ── */}
                           {st === 1 && isReporter && (
                             <button
                               className="btn-action btn-return"
-                              onClick={() => confirmReturn(idKey)}
+                              onClick={() => confirmHandoff(idKey)}
                               disabled={busy}
                             >
                               {busy ? "Confirming..." : "Confirm Physical Handoff"}
                             </button>
                           )}
-                          {st === 1 && !isReporter && (
+                          {st === 1 && !isReporter && account &&
+                            item.claimant.toLowerCase() === account.toLowerCase() && (
                             <div className="action-info">
                               Ownership verified &mdash; waiting for finder
-                              ({truncateAddress(item.reporter)}) to confirm handoff
+                              ({truncateAddress(item.reporter)}) to confirm handoff.
+                            </div>
+                          )}
+                          {st === 1 && !isReporter && account &&
+                            item.claimant.toLowerCase() !== account.toLowerCase() && (
+                            <div className="action-info">
+                              Ownership verified &mdash; handoff in progress.
                             </div>
                           )}
 
-                          {/* Returned → Complete */}
-                          {st === 2 && (
-                            <div className="action-info action-complete">
-                              Item successfully returned to verified owner
+                          {/* ── State 2: HandoffPending — claimant confirms receipt ── */}
+                          {st === 2 && (() => {
+                            const hi = item.handoffInfo;
+                            const isClaimant = account &&
+                              item.claimant.toLowerCase() === account.toLowerCase();
+                            const myPendingCancel = hi.hasPendingCancel &&
+                              hi.cancelRequester.toLowerCase() === account?.toLowerCase();
+                            const theirPendingCancel = hi.hasPendingCancel &&
+                              hi.cancelRequester.toLowerCase() !== account?.toLowerCase();
+
+                            return (
+                              <div className="action-group">
+                                {/* Step 2 button — only claimant can confirm receipt */}
+                                {isClaimant && !hi.hasPendingCancel && (
+                                  <button
+                                    className="btn-action btn-return"
+                                    onClick={() => confirmReceipt(idKey)}
+                                    disabled={busy}
+                                  >
+                                    {busy ? "Confirming..." : "Confirm I Received the Item"}
+                                  </button>
+                                )}
+                                {isReporter && !hi.hasPendingCancel && (
+                                  <div className="action-info">
+                                    You confirmed handoff &mdash; waiting for{" "}
+                                    {truncateAddress(item.claimant)} to confirm receipt.
+                                  </div>
+                                )}
+
+                                {/* Cancel system */}
+                                {!hi.hasPendingCancel && (
+                                  <button
+                                    className="btn-action btn-secondary"
+                                    onClick={() => requestCancelHandoff(idKey)}
+                                    disabled={busy}
+                                    title="Request mutual cancellation — other party must approve"
+                                  >
+                                    {busy ? "..." : "Request Cancellation"}
+                                  </button>
+                                )}
+                                {myPendingCancel && (
+                                  <div className="action-info" style={{color:"var(--warning)"}}>
+                                    You requested cancellation on{" "}
+                                    {formatTimestamp(hi.cancelRequestedAt)}.
+                                    Waiting for the other party to approve.
+                                  </div>
+                                )}
+                                {theirPendingCancel && (
+                                  <div className="action-group">
+                                    <div className="action-info" style={{color:"var(--warning)"}}>
+                                      {truncateAddress(hi.cancelRequester)} requested cancellation on{" "}
+                                      {formatTimestamp(hi.cancelRequestedAt)}.
+                                    </div>
+                                    <button
+                                      className="btn-action btn-found"
+                                      onClick={() => approveCancelHandoff(idKey)}
+                                      disabled={busy}
+                                    >
+                                      {busy ? "..." : "Approve Cancellation"}
+                                    </button>
+                                  </div>
+                                )}
+
+                                {/* Cancel audit trail */}
+                                {hi.totalCancels > 0 && (
+                                  <div className="cancel-audit">
+                                    <div className="cancel-audit-header">
+                                      Cancellation History ({hi.totalCancels})
+                                    </div>
+                                    {hi.cancelRecords.map((rec, idx) => (
+                                      <div key={idx} className="cancel-record">
+                                        <span className="cancel-label">Requested by</span>
+                                        <span className="cancel-addr">{truncateAddress(rec.requester)}</span>
+                                        <span className="cancel-time">{formatTimestamp(rec.requestedAt)}</span>
+                                        {rec.approved ? (
+                                          <>
+                                            <span className="cancel-label">Approved by</span>
+                                            <span className="cancel-addr">{truncateAddress(rec.approver)}</span>
+                                            <span className="cancel-time">{formatTimestamp(rec.approvedAt)}</span>
+                                          </>
+                                        ) : (
+                                          <span className="cancel-open">Open / Ignored</span>
+                                        )}
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })()}
+
+                          {/* ── State 3: Returned — complete ── */}
+                          {st === 3 && (
+                            <div className="action-group">
+                              <div className="action-info action-complete">
+                                Item successfully returned to verified owner.
+                              </div>
+                              {/* Show cancel history if any occurred */}
+                              {item.handoffInfo.totalCancels > 0 && (
+                                <div className="cancel-audit">
+                                  <div className="cancel-audit-header">
+                                    Cancellation History ({item.handoffInfo.totalCancels} on record)
+                                  </div>
+                                  {item.handoffInfo.cancelRecords.map((rec, idx) => (
+                                    <div key={idx} className="cancel-record">
+                                      <span className="cancel-label">Requested by</span>
+                                      <span className="cancel-addr">{truncateAddress(rec.requester)}</span>
+                                      <span className="cancel-time">{formatTimestamp(rec.requestedAt)}</span>
+                                      {rec.approved ? (
+                                        <>
+                                          <span className="cancel-label">Approved by</span>
+                                          <span className="cancel-addr">{truncateAddress(rec.approver)}</span>
+                                        </>
+                                      ) : (
+                                        <span className="cancel-open">Ignored (never approved)</span>
+                                      )}
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
                             </div>
                           )}
                         </div>

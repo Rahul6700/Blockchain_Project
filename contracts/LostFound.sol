@@ -3,43 +3,60 @@ pragma solidity ^0.8.20;
 
 /// @title LostFound — Trustless Blockchain Lost & Found Ledger
 ///
-/// @notice Records every item report, ownership claim, and return as an
-///         immutable on-chain transaction with no privileged admin account.
+/// State machine:
+///   Reported --> Claimed --> HandoffPending --> Returned
 ///
-/// State machine (fully trustless):
-///   Reported  -->  Claimed  -->  Returned
-///
-/// Who triggers each transition:
-///   Reported  : Anyone (the person who found the item)
-///   Claimed   : Anyone — the smart contract validates ownership via feature
-///               hashes automatically; no human needed
-///   Returned  : The original reporter (the finder who has physical custody)
-///
-/// Removing the admin role means no single account can block or manipulate
-/// the lifecycle of any item. Every transition is either self-executed by
-/// the finder or verified automatically by the contract.
+/// Rules:
+///   1. Reporter cannot claim their own item.
+///   2. Each address gets one attempt per item; reporter can selectively
+///      re-allow specific failed claimants (max MAX_REOPENS_PER_CLAIMANT).
+///      Other claimants are unaffected by any reopen.
+///   3. Two-step handoff: reporter confirms first, then claimant confirms receipt.
+///   4. Either party can request mutual cancellation of a pending handoff.
+///      The OTHER party must approve. Every request/approval is permanently
+///      recorded on-chain as a public audit trail.
 contract LostFound {
 
     uint private _nonce;
 
+    /// @notice Max times a reporter can reopen claiming for one claimant on one item.
+    uint public constant MAX_REOPENS_PER_CLAIMANT = 3;
+
     enum Status {
-        Reported,  // 0 — Item registered by the finder; finder has custody
-        Claimed,   // 1 — Ownership verified on-chain via feature hash matching
-        Returned   // 2 — Finder confirms physical handoff to verified owner
+        Reported,       // 0 — item registered; reporter has physical custody
+        Claimed,        // 1 — ownership verified via feature hashes
+        HandoffPending, // 2 — reporter confirmed handoff; waiting for claimant receipt
+        Returned        // 3 — both parties confirmed; complete
     }
 
     struct Item {
         bytes32   itemId;
-        address   reporter;   // the finder who has physical custody
-        address   claimant;   // the verified owner
+        address   reporter;    // finder who has physical custody
+        address   claimant;    // verified owner (set on successful claim)
         string    description;
         bytes32[] featureHashes;
         uint      threshold;
         Status    status;
         uint      reportedAt;
         uint      claimedAt;
+        uint      handoffAt;   // when reporter confirmed handoff
         uint      returnedAt;
-        uint      claimRound; // increments each time reporter reopens claiming
+    }
+
+    /// @notice Per-claimant tracking for a specific item.
+    struct ClaimantInfo {
+        uint failedAttempts; // total failed attempts (visible to reporter)
+        bool blocked;        // true after each attempt; reset by reporter reopen
+        uint reopensUsed;    // how many times reporter has re-allowed this claimant
+    }
+
+    /// @notice Permanent on-chain record of one handoff cancellation event.
+    struct CancelRecord {
+        address requester;   // who requested the cancel
+        uint    requestedAt;
+        bool    approved;    // false = open/ignored, true = approved and actioned
+        address approver;    // who approved (zero if not yet approved)
+        uint    approvedAt;
     }
 
     struct ClaimAttempt {
@@ -50,26 +67,33 @@ contract LostFound {
         uint    timestamp;
     }
 
+    // ======================== Storage ========================
+
     mapping(bytes32 => Item) private _items;
 
-    // _attempted[itemId][round][claimant] — one attempt per address per round
-    mapping(bytes32 => mapping(uint => mapping(address => bool))) private _attempted;
+    // itemId → claimant address → tracking info
+    mapping(bytes32 => mapping(address => ClaimantInfo)) private _claimantInfo;
+    // ordered list of all addresses that have attempted per item
+    mapping(bytes32 => address[]) private _itemClaimants;
+    // dedup guard — prevents same address appearing twice in _itemClaimants
+    mapping(bytes32 => mapping(address => bool)) private _isKnownClaimant;
 
-    bytes32[] public itemIds;
+    // cancel system
+    mapping(bytes32 => CancelRecord[]) private _cancelRecords;
+    mapping(bytes32 => bool)           private _hasPendingCancel;
+    mapping(bytes32 => uint)           private _pendingCancelIdx;
+
+    bytes32[]     public itemIds;
     ClaimAttempt[] public claimHistory;
 
     // ======================== Events ========================
 
-    /// @notice Emitted when a finder registers a found item on-chain.
     event ItemReported(
         bytes32 indexed itemId,
         address indexed reporter,
         string  description,
         uint    timestamp
     );
-
-    /// @notice Emitted on every claim attempt (success or failure).
-    ///         Provides a permanent, tamper-proof audit trail.
     event ClaimSubmitted(
         bytes32 indexed itemId,
         address indexed claimant,
@@ -78,27 +102,37 @@ contract LostFound {
         uint    threshold,
         uint    timestamp
     );
-
-    /// @notice Emitted when the feature-hash check succeeds and ownership
-    ///         is verified automatically by the contract.
     event ItemClaimed(
         bytes32 indexed itemId,
         address indexed claimant,
         uint    timestamp
     );
-
-    /// @notice Emitted when the finder (reporter) confirms physical handoff.
-    event ItemReturned(
-        bytes32 indexed itemId,
-        address indexed returnedTo,
-        uint    timestamp
-    );
-
-    /// @notice Emitted when the reporter reopens claiming for a new round.
-    event ClaimingReopened(
+    event ClaimantReopened(
         bytes32 indexed itemId,
         address indexed reporter,
-        uint    newRound,
+        address indexed claimant,
+        uint    reopensRemaining,
+        uint    timestamp
+    );
+    event HandoffConfirmed(
+        bytes32 indexed itemId,
+        address indexed reporter,
+        uint    timestamp
+    );
+    event ReceiptConfirmed(
+        bytes32 indexed itemId,
+        address indexed claimant,
+        uint    timestamp
+    );
+    event CancelHandoffRequested(
+        bytes32 indexed itemId,
+        address indexed requester,
+        uint    timestamp
+    );
+    event CancelHandoffApproved(
+        bytes32 indexed itemId,
+        address indexed requester,
+        address indexed approver,
         uint    timestamp
     );
 
@@ -111,19 +145,12 @@ contract LostFound {
 
     // ======================== Core Functions ========================
 
-    /// @dev Collision-resistant unique ID using timestamp, caller, and nonce.
     function _generateItemId() private returns (bytes32) {
         _nonce++;
         return keccak256(abi.encodePacked(block.timestamp, msg.sender, _nonce));
     }
 
-    /// @notice Register a found item on-chain. The caller (finder) implicitly
-    ///         declares physical custody of the item.
-    /// @param _description   Human-readable description visible to all users
-    /// @param _featureHashes keccak256 hashes of secret identifying features;
-    ///                       plaintext is never stored on-chain
-    /// @param _threshold     Minimum matching hashes required to approve a claim
-    /// @return The unique bytes32 identifier assigned to this item
+    /// @notice Register a found item on-chain.
     function reportItem(
         string    calldata _description,
         bytes32[] calldata _featureHashes,
@@ -133,11 +160,10 @@ contract LostFound {
         require(_featureHashes.length > 0, "At least one feature hash required");
         require(
             _threshold > 0 && _threshold <= _featureHashes.length,
-            "Threshold must be between 1 and the number of features"
+            "Threshold must be between 1 and number of features"
         );
 
         bytes32 itemId = _generateItemId();
-
         Item storage newItem = _items[itemId];
         newItem.itemId      = itemId;
         newItem.reporter    = msg.sender;
@@ -145,29 +171,20 @@ contract LostFound {
         newItem.threshold   = _threshold;
         newItem.status      = Status.Reported;
         newItem.reportedAt  = block.timestamp;
-        newItem.claimRound  = 0;
 
         for (uint i = 0; i < _featureHashes.length; i++) {
             newItem.featureHashes.push(_featureHashes[i]);
         }
-
         itemIds.push(itemId);
-
         emit ItemReported(itemId, msg.sender, _description, block.timestamp);
         return itemId;
     }
 
     /// @notice Submit an ownership claim by providing plaintext features.
-    ///         The contract hashes each string on-chain using keccak256 and
-    ///         compares the results against the stored feature hashes.
-    ///         If the number of matching hashes meets the threshold, ownership
-    ///         is verified automatically — no human intermediary is needed.
-    ///
-    ///         Valid transition: Reported --> Claimed
-    ///
-    /// @param _itemId   The unique item identifier
-    /// @param _features Plaintext feature strings to prove ownership
-    /// @return Whether the claim was approved
+    ///         The contract hashes them and compares against stored hashes.
+    ///         A claimant is blocked after every attempt (pass or fail).
+    ///         Only the reporter can unblock a specific failed claimant.
+    ///         Other claimants who haven't tried yet are completely unaffected.
     function claimItem(
         bytes32  _itemId,
         string[] calldata _features
@@ -175,19 +192,22 @@ contract LostFound {
         Item storage item = _items[_itemId];
         require(item.status == Status.Reported, "Item must be in Reported state to claim");
         require(_features.length > 0, "Must provide at least one feature");
+        require(msg.sender != item.reporter, "You reported this item and cannot claim it yourself");
 
-        // Rule 1: reporter cannot claim their own item
+        ClaimantInfo storage info = _claimantInfo[_itemId][msg.sender];
         require(
-            msg.sender != item.reporter,
-            "You reported this item and cannot claim it yourself"
+            !info.blocked,
+            "You have already attempted to claim this item. Wait for the reporter to reopen your attempt."
         );
 
-        // Rule 2: each address gets exactly one attempt per round
-        require(
-            !_attempted[_itemId][item.claimRound][msg.sender],
-            "You have already attempted to claim this item in the current round"
-        );
-        _attempted[_itemId][item.claimRound][msg.sender] = true;
+        // Add to claimant list on first attempt
+        if (!_isKnownClaimant[_itemId][msg.sender]) {
+            _isKnownClaimant[_itemId][msg.sender] = true;
+            _itemClaimants[_itemId].push(msg.sender);
+        }
+
+        // Block immediately — only reporter can unblock via reopenForClaimant
+        info.blocked = true;
 
         uint matchCount = 0;
         for (uint i = 0; i < _features.length; i++) {
@@ -201,6 +221,9 @@ contract LostFound {
         }
 
         bool success = matchCount >= item.threshold;
+        if (!success) {
+            info.failedAttempts++;
+        }
 
         claimHistory.push(ClaimAttempt({
             claimant:   msg.sender,
@@ -210,14 +233,7 @@ contract LostFound {
             timestamp:  block.timestamp
         }));
 
-        emit ClaimSubmitted(
-            _itemId,
-            msg.sender,
-            success,
-            matchCount,
-            item.threshold,
-            block.timestamp
-        );
+        emit ClaimSubmitted(_itemId, msg.sender, success, matchCount, item.threshold, block.timestamp);
 
         if (success) {
             item.claimant  = msg.sender;
@@ -229,46 +245,108 @@ contract LostFound {
         return success;
     }
 
-    /// @notice The original reporter (the finder who has physical custody)
-    ///         confirms they have handed the item back to the verified owner.
-    ///         Only the reporter can call this because they are the one holding
-    ///         the item — no privileged admin account is needed.
-    ///
-    ///         Valid transition: Claimed --> Returned
-    ///
-    /// @param _itemId The unique item identifier
-    function confirmReturn(bytes32 _itemId) external itemExists(_itemId) {
+    /// @notice Reporter unblocks one specific failed claimant, giving them
+    ///         exactly one more attempt. All other claimants are unaffected.
+    ///         Limited to MAX_REOPENS_PER_CLAIMANT per claimant per item.
+    function reopenForClaimant(bytes32 _itemId, address _claimant)
+        external itemExists(_itemId)
+    {
         Item storage item = _items[_itemId];
-        require(item.status == Status.Claimed, "Item must be in Claimed state to confirm return");
+        require(msg.sender == item.reporter, "Only the reporter can reopen for a claimant");
+        require(item.status == Status.Reported, "Item must be in Reported state");
+        require(_isKnownClaimant[_itemId][_claimant], "This address has not attempted to claim this item");
+
+        ClaimantInfo storage info = _claimantInfo[_itemId][_claimant];
+        require(info.blocked, "This claimant is not currently blocked");
         require(
-            msg.sender == item.reporter,
-            "Only the finder (original reporter) can confirm the physical handoff"
+            info.reopensUsed < MAX_REOPENS_PER_CLAIMANT,
+            "Maximum reopens already granted for this claimant"
         );
+
+        info.blocked = false;
+        info.reopensUsed++;
+
+        uint remaining = MAX_REOPENS_PER_CLAIMANT - info.reopensUsed;
+        emit ClaimantReopened(_itemId, msg.sender, _claimant, remaining, block.timestamp);
+    }
+
+    // ======================== Two-Step Handoff ========================
+
+    /// @notice Step 1 — Reporter confirms physical handoff. Claimed → HandoffPending.
+    function confirmHandoff(bytes32 _itemId) external itemExists(_itemId) {
+        Item storage item = _items[_itemId];
+        require(item.status == Status.Claimed, "Item must be in Claimed state");
+        require(msg.sender == item.reporter, "Only the reporter can confirm handoff");
+
+        item.status    = Status.HandoffPending;
+        item.handoffAt = block.timestamp;
+        emit HandoffConfirmed(_itemId, msg.sender, block.timestamp);
+    }
+
+    /// @notice Step 2 — Claimant confirms they received the item. HandoffPending → Returned.
+    function confirmReceipt(bytes32 _itemId) external itemExists(_itemId) {
+        Item storage item = _items[_itemId];
+        require(item.status == Status.HandoffPending, "Item must be in HandoffPending state");
+        require(msg.sender == item.claimant, "Only the verified owner can confirm receipt");
 
         item.status     = Status.Returned;
         item.returnedAt = block.timestamp;
-
-        emit ItemReturned(_itemId, item.claimant, block.timestamp);
+        emit ReceiptConfirmed(_itemId, msg.sender, block.timestamp);
     }
 
-    /// @notice Reporter reopens claiming by starting a new round.
-    ///         All previous claimants' attempts are preserved on-chain (audit
-    ///         trail) but the new round number resets everyone's eligibility.
-    ///         Only callable by the reporter while the item is still Reported.
-    ///
-    /// @param _itemId The unique item identifier
-    function reopenClaiming(bytes32 _itemId) external itemExists(_itemId) {
+    // ======================== Mutual Cancel ========================
+
+    /// @notice Either reporter or claimant can request cancellation of a pending handoff.
+    ///         The OTHER party must approve for it to take effect.
+    ///         Request stays open permanently if ignored — this is the public consequence.
+    ///         Only one pending request allowed at a time.
+    function requestCancelHandoff(bytes32 _itemId) external itemExists(_itemId) {
         Item storage item = _items[_itemId];
+        require(item.status == Status.HandoffPending, "Item must be in HandoffPending state");
         require(
-            msg.sender == item.reporter,
-            "Only the reporter can reopen claiming"
+            msg.sender == item.reporter || msg.sender == item.claimant,
+            "Only reporter or claimant can request cancellation"
         );
+        require(!_hasPendingCancel[_itemId], "A cancel request is already open");
+
+        _cancelRecords[_itemId].push(CancelRecord({
+            requester:   msg.sender,
+            requestedAt: block.timestamp,
+            approved:    false,
+            approver:    address(0),
+            approvedAt:  0
+        }));
+        _hasPendingCancel[_itemId] = true;
+        _pendingCancelIdx[_itemId] = _cancelRecords[_itemId].length - 1;
+
+        emit CancelHandoffRequested(_itemId, msg.sender, block.timestamp);
+    }
+
+    /// @notice The OTHER party approves the open cancel request.
+    ///         Item reverts to Claimed. Both addresses recorded permanently on-chain.
+    function approveCancelHandoff(bytes32 _itemId) external itemExists(_itemId) {
+        Item storage item = _items[_itemId];
+        require(item.status == Status.HandoffPending, "Item must be in HandoffPending state");
+        require(_hasPendingCancel[_itemId], "No pending cancel request");
         require(
-            item.status == Status.Reported,
-            "Can only reopen claiming on items in Reported state"
+            msg.sender == item.reporter || msg.sender == item.claimant,
+            "Only reporter or claimant can approve cancellation"
         );
-        item.claimRound++;
-        emit ClaimingReopened(_itemId, msg.sender, item.claimRound, block.timestamp);
+
+        uint idx = _pendingCancelIdx[_itemId];
+        CancelRecord storage rec = _cancelRecords[_itemId][idx];
+        require(msg.sender != rec.requester, "You cannot approve your own cancel request");
+
+        rec.approved   = true;
+        rec.approver   = msg.sender;
+        rec.approvedAt = block.timestamp;
+        _hasPendingCancel[_itemId] = false;
+
+        // Revert to Claimed; clear handoff timestamp
+        item.status    = Status.Claimed;
+        item.handoffAt = 0;
+
+        emit CancelHandoffApproved(_itemId, rec.requester, msg.sender, block.timestamp);
     }
 
     // ======================== View Functions ========================
@@ -283,8 +361,8 @@ contract LostFound {
         uint8   status,
         uint    reportedAt,
         uint    claimedAt,
-        uint    returnedAt,
-        uint    claimRound
+        uint    handoffAt,
+        uint    returnedAt
     ) {
         Item storage item = _items[_itemId];
         return (
@@ -297,24 +375,77 @@ contract LostFound {
             uint8(item.status),
             item.reportedAt,
             item.claimedAt,
-            item.returnedAt,
-            item.claimRound
+            item.handoffAt,
+            item.returnedAt
         );
     }
 
-    /// @notice Returns true if the address already used their attempt this round.
-    function hasAttemptedClaim(bytes32 _itemId, address _claimant)
-        external view itemExists(_itemId) returns (bool)
+    /// @notice All addresses that have ever attempted to claim this item.
+    ///         Reporter uses this to see who tried and manage selective reopens.
+    function getItemClaimants(bytes32 _itemId)
+        external view itemExists(_itemId) returns (address[] memory)
     {
-        Item storage item = _items[_itemId];
-        return _attempted[_itemId][item.claimRound][_claimant];
+        return _itemClaimants[_itemId];
     }
 
-    /// @notice Returns the current claim round number for an item.
-    function getClaimRound(bytes32 _itemId)
+    /// @notice Full tracking info for one claimant on one item.
+    function getClaimantInfo(bytes32 _itemId, address _claimant)
+        external view itemExists(_itemId)
+        returns (
+            uint failedAttempts,
+            bool blocked,
+            uint reopensUsed,
+            uint reopensRemaining
+        )
+    {
+        ClaimantInfo storage info = _claimantInfo[_itemId][_claimant];
+        uint remaining = info.reopensUsed >= MAX_REOPENS_PER_CLAIMANT
+            ? 0
+            : MAX_REOPENS_PER_CLAIMANT - info.reopensUsed;
+        return (info.failedAttempts, info.blocked, info.reopensUsed, remaining);
+    }
+
+    /// @notice Current handoff/cancel state — used by UI to render cancel buttons.
+    function getHandoffInfo(bytes32 _itemId)
+        external view itemExists(_itemId)
+        returns (
+            bool    hasPendingCancel,
+            address cancelRequester,
+            uint    cancelRequestedAt,
+            uint    totalCancels
+        )
+    {
+        bool pending = _hasPendingCancel[_itemId];
+        address requester = address(0);
+        uint    requestedAt = 0;
+        if (pending) {
+            CancelRecord storage rec = _cancelRecords[_itemId][_pendingCancelIdx[_itemId]];
+            requester   = rec.requester;
+            requestedAt = rec.requestedAt;
+        }
+        return (pending, requester, requestedAt, _cancelRecords[_itemId].length);
+    }
+
+    /// @notice One cancel record by index — full public audit trail.
+    function getCancelRecord(bytes32 _itemId, uint _index)
+        external view itemExists(_itemId)
+        returns (
+            address requester,
+            uint    requestedAt,
+            bool    approved,
+            address approver,
+            uint    approvedAt
+        )
+    {
+        require(_index < _cancelRecords[_itemId].length, "Index out of bounds");
+        CancelRecord storage rec = _cancelRecords[_itemId][_index];
+        return (rec.requester, rec.requestedAt, rec.approved, rec.approver, rec.approvedAt);
+    }
+
+    function getCancelCount(bytes32 _itemId)
         external view itemExists(_itemId) returns (uint)
     {
-        return _items[_itemId].claimRound;
+        return _cancelRecords[_itemId].length;
     }
 
     function getFeatureHashes(bytes32 _itemId) external view returns (bytes32[] memory) {
