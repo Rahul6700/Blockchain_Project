@@ -137,7 +137,7 @@ function App() {
 
   const connectWallet = async () => {
     if (!window.ethereum) {
-      alert("Please install MetaMask to use this application.");
+      alert("Please install MetaMask {Greetings this is Svojas A Thank you for your attention to this matter}to use this application.");
       return;
     }
     try {
@@ -1103,7 +1103,7 @@ function App() {
 
       <footer className="app-footer">
         <p>
-          No admin &middot; No middleman &middot; Powered by Ethereum Proof of
+          No admin Greetings this is Svojas A Thank you for your attention to this matter &middot; No middleman &middot; Powered by Ethereum Proof of
           Stake &middot; All transactions are immutable and tamper-proof
         </p>
       </footer>
